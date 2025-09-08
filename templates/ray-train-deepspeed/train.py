@@ -185,7 +185,7 @@ def main():
     )
 
     result = trainer.fit()
-    log_rank0(f"Training finished. Result: {result}")
+    print(f"Training finished. Result: {result}")
 
 
 def get_args():
