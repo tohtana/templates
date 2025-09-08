@@ -354,7 +354,7 @@ Ray’s TorchTrainer automatically launches multiple workers (one per GPU) and r
 DeepSpeed’s `ds_config` ensures that the right ZeRO stage and optimizations are applied inside each worker. Together, this setup makes it easy to scale from a single GPU to a multi-node cluster without changing your training loop code.
 
 
-## Advanced Configurations
+## Advanced Usage
 
 DeepSpeed has many other configuration options to tune performance and memory usage.
 Here we introduce some of the most commonly used options.
@@ -423,4 +423,13 @@ ds_config = {
 }
 ```
 
+### Convert Checkpoint for Inference
 
+As the checkpoint of DeepSpeed ZeRO Stage 3 is partitioned across multiple GPUs, it cannot be directly used for inference. To convert a ZeRO Stage 3 checkpoint to a standard model checkpoint that can be loaded for inference, you can use  `get_fp32_state_dict_from_zero_checkpoint` API.
+
+```python
+from deepspeed.utils.zero_to_fp32 import get_fp32_state_dict_from_zero_checkpoint
+# do the training and checkpoint saving
+state_dict = get_fp32_state_dict_from_zero_checkpoint(checkpoint_dir)
+torch.save(state_dict, "model_fp32.pt")
+```
