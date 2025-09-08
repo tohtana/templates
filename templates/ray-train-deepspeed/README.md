@@ -33,9 +33,8 @@ Install the required dependencies for this tutorial:
 
 ```bash
 %%bash
-pip install torch
-pip install torchvision
-pip install matplotlib
+pip install torch torchvision matplotlib
+pip install transformers datasets==3.6.0 trl
 pip install deepspeed
 ```
 

@@ -1,4 +1,11 @@
 import os
+import tempfile
+import uuid
+import logging
+
+import argparse
+from typing import Dict, Any
+
 os.environ["RAY_TRAIN_V2_ENABLED"] = "1"
 
 import ray
@@ -8,134 +15,181 @@ from ray.train.torch import TorchTrainer
 from ray.train import ScalingConfig, RunConfig, Checkpoint
 
 import torch
-from torch.nn import CrossEntropyLoss
-from torch.optim import Adam
 from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset, DownloadConfig
 
-from torchvision.models import VisionTransformer
-from torchvision.datasets import FashionMNIST
-from torchvision.transforms import ToTensor, Normalize, Compose
+import deepspeed
 
-import tempfile
-import uuid
-import logging
+
 logger = logging.getLogger(__name__)
 
 
-def init_model() -> torch.nn.Module:
-    model = VisionTransformer(
-        image_size=28,
-        patch_size=7,
-        num_layers=4,
-        num_heads=2,
-        hidden_dim=64,
-        mlp_dim=128,
-        num_classes=10,
-    )
-    model.conv_proj = torch.nn.Conv2d(
-        in_channels=1,
-        out_channels=64,
-        kernel_size=7,
-        stride=7,
-    )
-    return model
+def get_tokenizer(model_name: str, trust_remote_code: bool = True) -> Any:
+    """
+    Load and configure the tokenizer for the given model.
+    
+    Args:
+        model_name: Name of the model to load tokenizer for
+        trust_remote_code: Whether to trust remote code
+        
+    Returns:
+        Configured tokenizer
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=trust_remote_code)
+    
+    # Set pad token if not already set
+    if tokenizer.pad_token is None:
+        if tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        else:
+            # Fallback for models without eos_token
+            tokenizer.pad_token = tokenizer.convert_ids_to_tokens(2)
+    
+    return tokenizer
 
 
-def train_loop(config: dict):
-    model = init_model()
+def train_loop(config: Dict[str, Any]) -> None:
+
+    print(f"train_loop config: {config}")
+
+    # TODO: Load checkpoint if exists
+
+    tokenizer = get_tokenizer(config["model_name"], trust_remote_code=True)
+
+    split_str = f"train[:100%]"
+    dataset = load_dataset('ag_news', split=split_str, download_config=DownloadConfig(disable_tqdm=True))
+    text_column = 'text'
+
+    def tokenize_function(examples):
+        return tokenizer(examples[text_column], padding='max_length', max_length=config["seq_length"], truncation=True)
+    
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=1, keep_in_memory=True)
+    tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
+
+    data_loader = DataLoader(
+        tokenized_dataset, 
+        batch_size=config["batch_size"], 
+        shuffle=True
+    )
+    train_loader = ray.train.torch.prepare_data_loader(data_loader)
+
+    model = AutoModelForCausalLM.from_pretrained(config["model_name"], trust_remote_code=True)
+
+    print(f"#parameters: {sum(p.numel() for p in model.parameters())}")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["learning_rate"])
+    ds_engine, optimizer, _, _ = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        config=config["ds_config"],
+    )
+
     device = ray.train.torch.get_device()
-    torch.cuda.set_device(device)
-    model.to(device)
 
-    optimizer = Adam(model.parameters(), lr=config.get("learning_rate", 1e-3))
-    criterion = CrossEntropyLoss()
+    for epoch in range(config["epochs"]):
 
-    transform = Compose([ToTensor(), Normalize((0.5,), (0.5,))])
-    data_dir = os.path.join(tempfile.gettempdir(), "data")
-    train_ds = FashionMNIST(root=data_dir, train=True, download=True, transform=transform)
+        sum_loss = 0.0
+        num_steps = 0
+        for step, batch in enumerate(train_loader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            outputs = ds_engine(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
+            loss = outputs.loss
+            print(f"step {step} loss: {loss}")
+            ds_engine.backward(loss)
+            ds_engine.step()
 
-    dataloader = DataLoader(train_ds, batch_size=config.get("batch_size", 128), shuffle=True)
-    dataloader = ray.train.torch.prepare_data_loader(dataloader)
-
-    ckpt = ray.train.get_checkpoint()
-    if ckpt:
-        with ckpt.as_directory() as ckpt_dir:
-            state = torch.load(os.path.join(ckpt_dir, "state.pt"), map_location="cpu")
-            model.load_state_dict(state["model"])
-            optimizer.load_state_dict(state["optim"])
-
-    world_rank = ray.train.get_context().get_world_rank()
-
-    epochs = config.get("epochs", 5)
-    step = 0
-    for epoch in range(epochs):
-        running_loss = 0.0
-        batches = 0
-        for images, labels in dataloader:
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            running_loss += loss.item()
-            batches += 1
-            step += 1
-
-        avg_loss = running_loss / max(1, batches)
+            sum_loss += loss.item()
+            num_steps += 1
 
         with tempfile.TemporaryDirectory() as tmp:
-            torch.save({
-                "model": model.state_dict(),
-                "optim": optimizer.state_dict(),
-                "epoch": epoch,
-                "step": step,
-            }, os.path.join(tmp, "state.pt"))
-            ray.train.report({"loss": avg_loss, "epoch": epoch}, checkpoint=Checkpoint.from_directory(tmp))
-
-        if world_rank == 0:
-            print({"loss": avg_loss, "epoch": epoch})
+            tmp_epoch = os.path.join(tmp, "epoch")
+            os.makedirs(tmp_epoch, exist_ok=True)
+            model.save_checkpoint(tmp_epoch)
+            ray.train.report({"loss": sum_loss / num_steps, "epoch": epoch}, checkpoint=Checkpoint.from_directory(tmp))
 
 
-DEEPSPEED_CONFIG = {
-    "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": "auto",
-    "bf16": {"enabled": False},
-    "fp16": {"enabled": True},
-    "zero_optimization": {
-        "stage": 2,
-        "overlap_comm": True,
-        "contiguous_gradients": True,
-        "reduce_scatter": True,
-        "allgather_partitions": True,
-        "reduce_bucket_size": 5e7,
-        "stage3_prefetch_bucket_size": 5e7,
-        "stage3_param_persistence_threshold": 1e6,
-        "offload_param": {"device": "none"},
-        "offload_optimizer": {"device": "none"},
-    },
-    "gradient_clipping": 1.0,
-}
+def main():
+    args = get_args()
+    print(args)
 
-scaling_config = ScalingConfig(num_workers=2, use_gpu=True)
+    scaling_config = ScalingConfig(num_workers=2, use_gpu=True)
 
-train_loop_config = {
-    "epochs": 5,
-    "learning_rate": 1e-3,
-    "batch_size": 128,
-}
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "bf16": {"enabled": True},
+        "grad_accum_dtype": "bf16",
+        "zero_optimization": {
+            "stage": args.zero_stage,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+        },
+        "gradient_clipping": 1.0,
+    }
 
-run_config = RunConfig(
-    storage_path="/mnt/cluster_storage/",
-    name=f"deepspeed_mnist_{uuid.uuid4().hex[:8]}",
-)
+    train_loop_config = {
+        "epochs": args.num_epochs,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "ds_config": ds_config,
+        "model_name": args.model_name,
+        "seq_length": args.seq_length,
+    }
 
-trainer = TorchTrainer(
-    train_loop_per_worker=train_loop,
-    scaling_config=scaling_config,
-    train_loop_config=train_loop_config,
-    run_config=run_config
-)
+    run_config = RunConfig(
+        storage_path="/mnt/cluster_storage/",
+        name=f"deepspeed_sample_{uuid.uuid4().hex[:8]}",
+    )
 
-result = trainer.fit()
-print("Training finished", result)
+    trainer = TorchTrainer(
+        train_loop_per_worker=train_loop,
+        scaling_config=scaling_config,
+        train_loop_config=train_loop_config,
+        run_config=run_config,
+    )
+
+    result = trainer.fit()
+    print("Training finished", result)
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="MiniLLM/MiniPLM-Qwen-500M")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--seq_length", type=int, default=512)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--activation_checkpointing", action="store_true")
+    parser.add_argument("--eval", action="store_true")
+    parser.add_argument("--dataset_name", type=str, default="wikitext", help="Dataset name for pretraining evaluation")
+    parser.add_argument("--dataset_percentage", type=float, default=10.0, help="Percentage of dataset to use (e.g., 10.0 for 10 percent)")
+    parser.add_argument("--num_layers", type=int, default=0)
+    parser.add_argument("--attn_impl", type=str, default="sdpa")
+    parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--passes", type=str, default=None)
+    parser.add_argument("--backend", type=str, default="inductor")
+    parser.add_argument("--offload_opt_states", action="store_true")
+    parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--deterministic", action="store_true")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+    parser.add_argument("--profile_dir", type=str, default=None)
+    parser.add_argument("--bench_step", type=int, default=100)
+    parser.add_argument("--warmup_step", type=int, default=15)
+    parser.add_argument("--zero_stage", type=int, default=3)
+    parser.add_argument("--log_interval", type=int, default=10)
+    parser.add_argument("--save_weights", action="store_true")
+    parser.add_argument("--load_weights", action="store_true")
+        # WandB logging arguments
+    parser.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--wandb_project", type=str, default="ds-verify-loss", help="WandB project name")
+    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
+    parser.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags for the run")
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    main()
