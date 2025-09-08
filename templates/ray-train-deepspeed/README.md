@@ -27,23 +27,27 @@ For demonstration purposes, we will integrate Ray Train with DeepSpeed ZeRO usin
 
 While this is a relatively simple example, DeepSpeed configuration (e.g., ZeRO stage, precision, and offloading) can lead to common challenges such as out-of-memory (OOM) errors or suboptimal throughput. Throughout this guide, we'll address these by tuning ZeRO stage (2/3), micro-batch size, mixed precision (bf16/fp16), and optional CPU offloading to balance memory usage and performance for your specific environment.
 
-## 1. Package setup
-
 Install the required dependencies for this tutorial:
 
 ```bash
 %%bash
-pip install torch
-pip install torchvision
-pip install matplotlib
+pip install torch torchvision matplotlib
+pip install transformers datasets==3.6.0 trl
 pip install deepspeed
 ```
 
-This snippet installs PyTorch and torchvision for core training and datasets, matplotlib for simple visualization, and DeepSpeed to enable ZeRO optimization. In production, ensure Torch/DeepSpeed wheels match your CUDA and driver versions (or use CPU-only wheels where appropriate). The next Python block enables Ray Train V2 APIs and imports the modules used to define the model, data pipeline, trainer configuration, and DeepSpeed runtime settings.
+### 1. Import packages
+
+In out Python script, let's import necessary packages and set up a logger.
 
 ```python
 import os
-os.environ["RAY_TRAIN_V2_ENABLED"] = "1"
+import tempfile
+import uuid
+import logging
+
+import argparse
+from typing import Dict, Any
 
 import ray
 import ray.train
@@ -52,97 +56,139 @@ from ray.train.torch import TorchTrainer
 from ray.train import ScalingConfig, RunConfig, Checkpoint
 
 import torch
-from torch.nn import CrossEntropyLoss
-from torch.optim import Adam
 from torch.utils.data import DataLoader
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from datasets import load_dataset, DownloadConfig
 
-from torchvision.models import VisionTransformer
-from torchvision.datasets import FashionMNIST
-from torchvision.transforms import ToTensor, Normalize, Compose
+import deepspeed
 
-import tempfile
-import uuid
-import logging
 logger = logging.getLogger(__name__)
 ```
 
-## 2. Model and train loop
+
+### 2. Set up dataloader
+
+The `setup_dataloader` function initializes and prepares a PyTorch `DataLoader` for training.
+
+It starts by fetching the tokenizer for the specified `model_name`. It then loads the `ag_news` dataset, tokenizes the text data, and formats it for PyTorch.
+Finally, it wraps the dataset in a `DataLoader` and uses `ray.train.torch.prepare_data_loader` to make it compatible with distributed training in Ray Train.
+
+In this example, we use 
 
 ```python
-def init_model() -> torch.nn.Module:
-    model = VisionTransformer(
-        image_size=28,
-        patch_size=7,
-        num_layers=4,
-        num_heads=2,
-        hidden_dim=64,
-        mlp_dim=128,
-        num_classes=10,
+def setup_dataloader(model_name: str, dataset_name: str, seq_length: int, batch_size: int) -> DataLoader:
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    dataset = load_dataset(dataset_name, split="train[:100%]")
+
+    def tokenize_function(examples):
+        return tokenizer(examples['text'], padding='max_length', max_length=seq_length, truncation=True)
+    
+    tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=1, keep_in_memory=True)
+    tokenized_dataset.set_format(type='torch', columns=['input_ids', 'attention_mask'])
+
+    data_loader = DataLoader(
+        tokenized_dataset, 
+        batch_size=batch_size,
+        shuffle=True
     )
-    model.conv_proj = torch.nn.Conv2d(
-        in_channels=1,
-        out_channels=64,
-        kernel_size=7,
-        stride=7,
-    )
-    return model
+
+    return ray.train.torch.prepare_data_loader(data_loader)
 ```
 
+
+### 3. Model initialization
+
+The `setup_model_and_optimizer` function prepares the model for training. It loads a pretrained causal language model from Hugging Face and initializes an AdamW optimizer. It then uses `deepspeed.initialize` to configure the model and optimizer with the provided DeepSpeed configuration. The function returns the `DeepSpeedEngine`, which manages the model during distributed training.
+
 ```python
-def train_loop(config: dict):
-    model = init_model()
-    device = ray.train.torch.get_device()
-    torch.cuda.set_device(device)
-    model.to(device)
+def setup_model_and_optimizer(model_name: str, learning_rate: float, ds_config: Dict[str, Any]) -> deepspeed.runtime.engine.DeepSpeedEngine:
+    model = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
+    log_rank0(f"Model loaded: {model_name} (#parameters: {sum(p.numel() for p in model.parameters())}")
 
-    optimizer = Adam(model.parameters(), lr=config.get("learning_rate", 1e-3))
-    criterion = CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    ds_engine, optimizer, _, _ = deepspeed.initialize(
+        model=model,
+        optimizer=optimizer,
+        config=ds_config,
+    )
+    return ds_engine
+```
 
-    transform = Compose([ToTensor(), Normalize((0.5,), (0.5,))])
-    data_dir = os.path.join(tempfile.gettempdir(), "data")
-    train_ds = FashionMNIST(root=data_dir, train=True, download=True, transform=transform)
 
-    dataloader = DataLoader(train_ds, batch_size=config.get("batch_size", 128), shuffle=True)
-    dataloader = ray.train.torch.prepare_data_loader(dataloader)
+## 4. Checkpointing and Loading
 
+Checkpointing is crucial for fault tolerance and resuming training. The `report_metrics_and_save_checkpoint` function saves the model's state using `ds_engine.save_checkpoint` into a temporary directory and then reports it to Ray Train along with performance metrics.
+ 
+ ```python
+ def report_metrics_and_save_checkpoint(
+    ds_engine: deepspeed.runtime.engine.DeepSpeedEngine,
+    metrics: Dict[str, Any]
+) -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_epoch = os.path.join(tmp, "epoch")
+        os.makedirs(tmp_epoch, exist_ok=True)
+        ds_engine.save_checkpoint(tmp_epoch)
+        torch.distributed.barrier()
+        ray.train.report(metrics, checkpoint=Checkpoint.from_directory(tmp))
+
+    log_rank0(f"Checkpoint saved successfully. Metrics: {metrics}")
+```
+
+The `load_checkpoint` function handles restoring the training state by loading a Ray Train `Checkpoint` into the DeepSpeed engine, allowing the training to resume from a previously saved state.
+
+```python
+def load_checkpoint( ds_engine: deepspeed.runtime.engine.DeepSpeedEngine, ckpt: ray.train.Checkpoint):
+    try:
+        with ckpt.as_directory() as checkpoint_dir:
+            ds_engine.load_checkpoint(checkpoint_dir)
+
+        torch.distributed.barrier()
+        log_rank0("Successfully loaded distributed checkpoint")
+    except Exception as e:
+        logger.error(f"Failed to load checkpoint: {e}")
+        raise RuntimeError(f"Checkpoint loading failed: {e}") from e
+```
+
+
+### 5. Training Iteration
+
+The `train_loop` function orchestrates the entire training process. It begins by setting up the dataloader, model, and optimizer. If a checkpoint exists, it restores the training state. The function then iterates through the specified number of epochs, and for each epoch, it loops over the training data.
+
+In each step, it performs a forward pass to compute the loss, followed by a backward pass and an optimizer step to update the model weights. At the end of each epoch, it reports the average loss and saves a checkpoint.
+
+```python
+def train_loop(config: Dict[str, Any]) -> None:
+
+    # Load checkpoint if exists
     ckpt = ray.train.get_checkpoint()
     if ckpt:
-        with ckpt.as_directory() as ckpt_dir:
-            state = torch.load(os.path.join(ckpt_dir, "state.pt"), map_location="cpu")
-            model.load_state_dict(state["model"])
-            optimizer.load_state_dict(state["optim"])
+        load_checkpoint(ds_engine, ckpt)
 
-    world_rank = ray.train.get_context().get_world_rank()
+    train_loader = setup_dataloader(config["model_name"], config["seq_length"], config["batch_size"])
+    ds_engine = setup_model_and_optimizer(config["model_name"], config["learning_rate"], config["ds_config"])
+    device = ray.train.torch.get_device()
 
-    epochs = config.get("epochs", 5)
-    step = 0
-    for epoch in range(epochs):
+    for epoch in range(config["epochs"]):
+        if ray.train.get_context().get_world_size() > 1:
+            train_loader.sampler.set_epoch(epoch)
+
         running_loss = 0.0
-        batches = 0
-        for images, labels in dataloader:
-            optimizer.zero_grad(set_to_none=True)
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
+        num_batches = 0
+        for step, batch in enumerate(train_loader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch['attention_mask'].to(device)
+            outputs = ds_engine(input_ids=input_ids, attention_mask=attention_mask, labels=input_ids, use_cache=False)
+            loss = outputs.loss
+            log_rank0(f"step {step} loss: {loss.item()}")
+
+            ds_engine.backward(loss)
+            ds_engine.step()
 
             running_loss += loss.item()
-            batches += 1
-            step += 1
+            num_batches += 1
 
-        avg_loss = running_loss / max(1, batches)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            torch.save({
-                "model": model.state_dict(),
-                "optim": optimizer.state_dict(),
-                "epoch": epoch,
-                "step": step,
-            }, os.path.join(tmp, "state.pt"))
-            ray.train.report({"loss": avg_loss, "epoch": epoch}, checkpoint=Checkpoint.from_directory(tmp))
-
-        if world_rank == 0:
-            print({"loss": avg_loss, "epoch": epoch})
+        report_metrics_and_save_checkpoint(ds_engine, {"loss": running_loss / num_batches, "epoch": epoch})
 ```
 
 ## 3. DeepSpeed config
