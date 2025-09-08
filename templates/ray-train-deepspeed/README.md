@@ -191,61 +191,69 @@ def train_loop(config: Dict[str, Any]) -> None:
         report_metrics_and_save_checkpoint(ds_engine, {"loss": running_loss / num_batches, "epoch": epoch})
 ```
 
-## 3. DeepSpeed config
+
+## 6. Configure DeepSpeed and Launch Trainer
+
+The `main` function ties everything together. It starts by parsing command-line arguments and then defines the `ScalingConfig` to specify the distributed training setup.
+
+ It constructs the `ds_config` dictionary with DeepSpeed-specific settings like ZeRO optimization and mixed-precision training. All the configurations are passed to the `TorchTrainer`, which is then launched by calling `trainer.fit()`. The `get_args` function is a helper that defines and parses all the command-line arguments for the script.
 
 ```python
-DEEPSPEED_CONFIG = {
-    "train_batch_size": "auto",
-    "train_micro_batch_size_per_gpu": "auto",
-    "bf16": {"enabled": False},
-    "fp16": {"enabled": True},
-    "zero_optimization": {
-        "stage": 2,
-        "overlap_comm": True,
-        "contiguous_gradients": True,
-        "reduce_scatter": True,
-        "allgather_partitions": True,
-        "reduce_bucket_size": 5e7,
-        "stage3_prefetch_bucket_size": 5e7,
-        "stage3_param_persistence_threshold": 1e6,
-        "offload_param": {"device": "none"},
-        "offload_optimizer": {"device": "none"},
-    },
-    "gradient_clipping": 1.0,
-}
+def main():
+    args = get_args()
+    print(args)
+
+    scaling_config = ScalingConfig(num_workers=2, use_gpu=True)
+
+    ds_config = {
+        "train_micro_batch_size_per_gpu": args.batch_size,
+        "bf16": {"enabled": True},
+        "grad_accum_dtype": "bf16",
+        "zero_optimization": {
+            "stage": args.zero_stage,
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+        },
+        "gradient_clipping": 1.0,
+    }
+
+    train_loop_config = {
+        "epochs": args.num_epochs,
+        "learning_rate": args.learning_rate,
+        "batch_size": args.batch_size,
+        "ds_config": ds_config,
+        "model_name": args.model_name,
+        "seq_length": args.seq_length,
+    }
+
+    run_config = RunConfig(
+        storage_path="/mnt/cluster_storage/",
+        name=f"deepspeed_sample_{uuid.uuid4().hex[:8]}",
+    )
+
+    trainer = TorchTrainer(
+        train_loop_per_worker=train_loop,
+        scaling_config=scaling_config,
+        train_loop_config=train_loop_config,
+        run_config=run_config,
+    )
+
+    result = trainer.fit()
+    log_rank0(f"Training finished. Result: {result}")
+
+
+def get_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_name", type=str, default="MiniLLM/MiniPLM-Qwen-500M")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--num_epochs", type=int, default=1)
+    parser.add_argument("--seq_length", type=int, default=512)
+    parser.add_argument("--learning_rate", type=float, default=1e-6)
+    parser.add_argument("--zero_stage", type=int, default=3)
+
+    return parser.parse_args()
+
+
+if __name__ == "__main__":
+    main()
 ```
-
-## 4. Launch trainer
-
-```python
-scaling_config = ScalingConfig(num_workers=2, use_gpu=True)
-
-train_loop_config = {
-    "epochs": 5,
-    "learning_rate": 1e-3,
-    "batch_size": 128,
-}
-
-run_config = RunConfig(
-    storage_path="/mnt/cluster_storage/",
-    name=f"deepspeed_mnist_{uuid.uuid4().hex[:8]}",
-)
-
-trainer = TorchTrainer(
-    train_loop_per_worker=train_loop,
-    scaling_config=scaling_config,
-    train_loop_config=train_loop_config,
-    run_config=run_config,
-    deepspeed_config=DEEPSPEED_CONFIG,
-)
-
-result = trainer.fit()
-print("Training finished", result)
-```
-
-## Notes
-
-- Enable `bf16` when supported; otherwise use `fp16`.
-- Consider ZeRO Stage 3 for larger models.
-- Enable CPU offload in `zero_optimization` when GPU memory is constrained.
-- Tune micro-batch size to avoid OOMs.

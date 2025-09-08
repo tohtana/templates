@@ -185,7 +185,7 @@ def main():
     )
 
     result = trainer.fit()
-    print("Training finished", result)
+    log_rank0(f"Training finished. Result: {result}")
 
 
 def get_args():
@@ -195,33 +195,7 @@ def get_args():
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--seq_length", type=int, default=512)
     parser.add_argument("--learning_rate", type=float, default=1e-6)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
-    parser.add_argument("--activation_checkpointing", action="store_true")
-    parser.add_argument("--eval", action="store_true")
-    parser.add_argument("--dataset_name", type=str, default="wikitext", help="Dataset name for pretraining evaluation")
-    parser.add_argument("--dataset_percentage", type=float, default=10.0, help="Percentage of dataset to use (e.g., 10.0 for 10 percent)")
-    parser.add_argument("--num_layers", type=int, default=0)
-    parser.add_argument("--attn_impl", type=str, default="sdpa")
-    parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--passes", type=str, default=None)
-    parser.add_argument("--backend", type=str, default="inductor")
-    parser.add_argument("--offload_opt_states", action="store_true")
-    parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
-    parser.add_argument("--profile_dir", type=str, default=None)
-    parser.add_argument("--bench_step", type=int, default=100)
-    parser.add_argument("--warmup_step", type=int, default=15)
     parser.add_argument("--zero_stage", type=int, default=3)
-    parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_weights", action="store_true")
-    parser.add_argument("--load_weights", action="store_true")
-        # WandB logging arguments
-    parser.add_argument("--use_wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--wandb_project", type=str, default="ds-verify-loss", help="WandB project name")
-    parser.add_argument("--wandb_run_name", type=str, default=None, help="WandB run name")
-    parser.add_argument("--wandb_tags", type=str, nargs="+", default=[], help="WandB tags for the run")
 
     return parser.parse_args()
 
