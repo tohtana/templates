@@ -160,7 +160,11 @@ def load_checkpoint(ds_engine: deepspeed.runtime.engine.DeepSpeedEngine, ckpt: r
 
 ### 5. Training Iteration
 
-The `train_loop` function orchestrates the entire training process. It begins by setting up the dataloader, model, and optimizer. If a checkpoint exists, it restores the training state. The function then iterates through the specified number of epochs, and for each epoch, it loops over the training data.
+In Ray Train, we define a function that orchestrates the entire training process.
+This function runs on each process that corresponds to a GPU.
+
+In our example, we first call functions defined above: loading a checkpoint if exists, set up a data loader, and initialize DeepSpeed.
+The function then iterates through the specified number of epochs, and for each epoch, it loops over the training data.
 
 In each step, it performs a forward pass to compute the loss, followed by a backward pass and an optimizer step to update the model weights. At the end of each epoch, it reports the average loss and saves a checkpoint.
 
@@ -201,9 +205,16 @@ def train_loop(config: Dict[str, Any]) -> None:
 
 ## 6. Configure DeepSpeed and Launch Trainer
 
-The `main` function ties everything together. It starts by parsing command-line arguments and then defines the `ScalingConfig` to specify the distributed training setup.
+The final step is to launch the training iteration on multiple GPUs. Ray Train offers a simple API designed for the purpose.
+We just need to set configurations given by command line arguments and launch `TorchTrainer`.
 
- It constructs the `ds_config` dictionary with DeepSpeed-specific settings like ZeRO optimization and mixed-precision training. All the configurations are passed to the `TorchTrainer`, which is then launched by calling `trainer.fit()`. The `get_args` function is a helper that defines and parses all the command-line arguments for the script.
+We use three different types of configurations.
+- Training parameters: batch size, learning rate, etc.
+- DeepSpeed: Parallelization config, precision, offload, performance tuning parameters like communication buffer size, etc.
+- Ray Train: Runtime configurations including storage path, experiment name, etc.
+
+The configurations are passed to `TorchTrainer`, which takes care of launching the training function on multiple GPUs.
+Then, we call `trainer.fit()` to start actors, each running the training function.
 
 ```python
 def main():
@@ -264,3 +275,75 @@ def get_args():
 if __name__ == "__main__":
     main()
 ```
+
+
+## Advanced Configurations
+
+DeepSpeed has many other configuration options to tune performance and memory usage.
+Here we introduce some of the most commonly used options.
+Please refer to the [DeepSpeed documentation](https://www.deepspeed.ai/docs/config-json/) for more details.
+
+
+### DeepSpeed ZeRO Stages
+
+DeepSpeed ZeRO has three stages, each providing different levels of memory optimization and performance trade-offs.
+
+- **Stage 1**: This stage focuses on optimizer state partitioning. It reduces memory usage by partitioning the optimizer states across data parallel workers. This is the least aggressive stage and is suitable for most models without significant changes.
+- **Stage 2**: In addition to optimizer state partitioning, this stage also partitions the gradients. This further reduces memory usage but may introduce some communication overhead. It's a good choice for larger models that can benefit from additional memory savings.
+- **Stage 3**: This is the most aggressive stage, which partitions both the optimizer states and the model parameters. It provides the highest memory savings but may require more careful tuning of the training process. This stage is recommended for very large models that cannot fit into the memory of a single GPU.
+
+You can select the desired ZeRO stage by setting the `zero_stage` parameter in the DeepSpeed configuration dictionary passed to `deepspeed.initialize`.
+
+```python
+ds_config = {
+    "zero_optimization": {
+        "stage": 2,  # or 1 or 3
+...
+    },
+}
+```
+
+
+### Mixed Precision Training
+
+Mixed precision training is a technique that uses both 16-bit and 32-bit floating-point types in a single network. This can lead to faster training times and reduced memory usage. DeepSpeed has built-in support for mixed precision training using either FP16 or BF16.
+
+To enable mixed precision training, you can set the `bf16` or `fp16` parameters in the DeepSpeed configuration dictionary. For example:
+
+```python
+ds_config = {
+    "bf16": {"enabled": True}, # or "fp16": {"enabled": True}
+}
+```
+
+Note that these options keep the clone of weights/gradients and optimizer states in 32-bit precision to maintain numerical stability.
+
+
+### CPU Offloading
+
+DeepSpeed supports offloading model states and optimizer states to CPU memory.
+Offloading these causes a certain amount of overhead due to data transfer between CPU and GPU, but it significantly reduces GPU memory usage, which can be beneficial when training very large models that do not fit into GPU memory.
+
+To enable CPU offloading, you can set the `offload` parameters in the DeepSpeed configuration dictionary. For example:
+
+```python
+ds_config = {
+    "offload_param": {
+        "device": "cpu",
+        "pin_memory": True,
+    }
+}
+```
+
+You can also offload only optimizer states similarly by using the `offload_optimizer` parameter.
+
+```python
+ds_config = {
+    "offload_optimizer": {
+        "device": "cpu",
+        "pin_memory": True,
+    }
+}
+```
+
+
