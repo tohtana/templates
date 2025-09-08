@@ -54,10 +54,10 @@ def get_tokenizer(model_name: str, trust_remote_code: bool = True) -> Any:
     return tokenizer
 
 
-def setup_dataloader(model_name: str, seq_length: int, batch_size: int) -> DataLoader:
+def setup_dataloader(model_name: str, dataset_name: str, seq_length: int, batch_size: int) -> DataLoader:
     tokenizer = get_tokenizer(model_name, trust_remote_code=True)
 
-    dataset = load_dataset('ag_news', split=f"train[:100%]", download_config=DownloadConfig(disable_tqdm=True))
+    dataset = load_dataset(dataset_name, split=f"train[:100%]", download_config=DownloadConfig(disable_tqdm=True))
 
     def tokenize_function(examples):
         return tokenizer(examples['text'], padding='max_length', max_length=seq_length, truncation=True)
@@ -119,7 +119,7 @@ def train_loop(config: Dict[str, Any]) -> None:
     if ckpt:
         load_checkpoint(ds_engine, ckpt)
 
-    train_loader = setup_dataloader(config["model_name"], config["seq_length"], config["batch_size"])
+    train_loader = setup_dataloader(config["model_name"], config["dataset_name"], config["seq_length"], config["batch_size"])
     ds_engine = setup_model_and_optimizer(config["model_name"], config["learning_rate"], config["ds_config"])
     device = ray.train.torch.get_device()
 
@@ -170,6 +170,7 @@ def main():
         "ds_config": ds_config,
         "model_name": args.model_name,
         "seq_length": args.seq_length,
+        "dataset_name": args.dataset_name,
     }
 
     run_config = RunConfig(
@@ -191,6 +192,7 @@ def main():
 def get_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_name", type=str, default="MiniLLM/MiniPLM-Qwen-500M")
+    parser.add_argument("--dataset_name", type=str, default="ag_news")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_epochs", type=int, default=1)
     parser.add_argument("--seq_length", type=int, default=512)
