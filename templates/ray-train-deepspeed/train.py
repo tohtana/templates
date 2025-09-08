@@ -4,7 +4,7 @@ import uuid
 import logging
 
 import argparse
-from typing import Dict, Any, Tuple
+from typing import Dict, Any
 
 os.environ["RAY_TRAIN_V2_ENABLED"] = "1"
 
